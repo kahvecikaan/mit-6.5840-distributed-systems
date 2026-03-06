@@ -17,8 +17,8 @@ type inProgressInfo struct {
 }
 
 type Coordinator struct {
-	mapTasks    chan Task
-	reduceTasks chan Task
+	mapTasks    chan Task // map tasks waiting to be assigned
+	reduceTasks chan Task // reduce tasks waiting to be assigned
 
 	done chan struct{} // closed when entire job is complete
 
@@ -32,7 +32,7 @@ type Coordinator struct {
 	nReduce     int
 }
 
-// Your code here -- RPC handlers for the worker to call.
+// RPC handlers for the worker to call.
 
 // an example RPC handler.
 //
@@ -59,7 +59,6 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	// Your code here.
 	select {
 	case <-c.done:
 		return true
@@ -101,23 +100,9 @@ func (c *Coordinator) timeoutChecker() {
 	for {
 		time.Sleep(1 * time.Second)
 
-		var timedOutMap []Task
-		var timedOutReduce []Task
-
 		c.mu.Lock()
-		for id, info := range c.mapInProgress {
-			if time.Since(info.startTime) > 10*time.Second {
-				timedOutMap = append(timedOutMap, info.task)
-				delete(c.mapInProgress, id)
-			}
-		}
-
-		for id, info := range c.reduceInProgress {
-			if time.Since(info.startTime) > 10*time.Second {
-				timedOutReduce = append(timedOutReduce, info.task)
-				delete(c.reduceInProgress, id)
-			}
-		}
+		timedOutMap := collectTimedOut(c.mapInProgress)
+		timedOutReduce := collectTimedOut(c.reduceInProgress)
 		c.mu.Unlock()
 
 		for _, task := range timedOutMap {
@@ -130,21 +115,24 @@ func (c *Coordinator) timeoutChecker() {
 	}
 }
 
+func collectTimedOut(inProgress map[int]inProgressInfo) []Task {
+	var timedOut []Task
+	for id, info := range inProgress {
+		if time.Since(info.startTime) > 10*time.Second {
+			timedOut = append(timedOut, info.task)
+			delete(inProgress, id)
+		}
+	}
+
+	return timedOut
+}
+
 func (c *Coordinator) GetTask(args *TaskArgs, reply *TaskReply) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	select {
-	case task := <-c.mapTasks:
-		c.mapInProgress[task.TaskId] = inProgressInfo{
-			task:      task,
-			startTime: time.Now(),
-		}
-
-		reply.Task = task
+	if tryAssign(c.mapTasks, c.mapInProgress, reply) {
 		return nil
-	default:
-		// channel is empty, non-blocking
 	}
 
 	if c.nMapDone < c.nMap {
@@ -153,25 +141,29 @@ func (c *Coordinator) GetTask(args *TaskArgs, reply *TaskReply) error {
 		return nil
 	}
 
-	select {
-	case task := <-c.reduceTasks:
-		c.reduceInProgress[task.TaskId] = inProgressInfo{
-			task:      task,
-			startTime: time.Now(),
-		}
-
-		reply.Task = task
+	if tryAssign(c.reduceTasks, c.reduceInProgress, reply) {
 		return nil
-	default:
 	}
 
 	if c.nReduceDone < c.nReduce {
+		// all the reduce tasks are being ran by some workers, but one of them might fail so check back soon
 		reply.Task = Task{TaskType: WaitTask}
 		return nil
 	}
 
 	reply.Task = Task{TaskType: DoneTask}
 	return nil
+}
+
+func tryAssign(ch chan Task, inProgress map[int]inProgressInfo, reply *TaskReply) bool {
+	select {
+	case task := <-ch:
+		inProgress[task.TaskId] = inProgressInfo{task: task, startTime: time.Now()}
+		reply.Task = task
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *Coordinator) ReportDone(args *DoneArgs, reply *DoneReply) error {
