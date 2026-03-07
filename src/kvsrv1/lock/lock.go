@@ -35,8 +35,13 @@ func (lk *Lock) Acquire() {
 	for {
 		val, ver, _ := lk.ck.Get(lk.key) // check: who holds the lock for that specific key?
 
+		if val == lk.id {
+			return // previous attempt succeeded via ErrMaybe, we already hold it
+		}
+
 		if val == "" { // lock is free
-			if err := lk.ck.Put(lk.key, lk.id, ver); err == rpc.OK { // try to claim it
+			// try to claim it
+			if err := lk.ck.Put(lk.key, lk.id, ver); err == rpc.OK {
 				return // got it
 			}
 		}
@@ -46,6 +51,14 @@ func (lk *Lock) Acquire() {
 }
 
 func (lk *Lock) Release() {
-	_, ver, _ := lk.ck.Get(lk.key)
-	lk.ck.Put(lk.key, "", ver) // release the lock
+	for {
+		val, ver, _ := lk.ck.Get(lk.key)
+		if val == "" { // confirmed free
+			return
+		}
+
+		if lk.ck.Put(lk.key, "", ver) == rpc.OK {
+			return // confirmed released
+		}
+	}
 }

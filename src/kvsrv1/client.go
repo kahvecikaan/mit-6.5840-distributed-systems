@@ -1,6 +1,8 @@
 package kvsrv
 
 import (
+	"time"
+
 	"6.5840/kvsrv1/rpc"
 	"6.5840/kvtest1"
 	"6.5840/tester1"
@@ -35,6 +37,9 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 		if ok := ck.clnt.Call(ck.server, "KVServer.Get", &args, &reply); ok {
 			return reply.Value, reply.Version, reply.Err
 		}
+
+		// in case of a failure, wait to not overwhelm the server
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -64,7 +69,21 @@ func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 
 	reply := rpc.PutReply{}
 
-	_ = ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply)
+	retried := false
 
-	return reply.Err
+	for {
+		if ok := ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply); !ok {
+			retried = true
+			time.Sleep(100 * time.Millisecond)
+			continue // retry
+		}
+
+		// if we got an ErrVersion for the second time, it might either because of a failed attempt (stale version)
+		// or, if our first attempt already executed and incremented the version, so return ErrMaybe to the application
+		if reply.Err == rpc.ErrVersion && retried {
+			return rpc.ErrMaybe
+		}
+
+		return reply.Err
+	}
 }
