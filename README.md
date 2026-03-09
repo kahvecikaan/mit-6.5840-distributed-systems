@@ -67,3 +67,81 @@ cd src/main && go run -race mrworker.go wc.so
 # Run the full test suite
 cd src/main && bash test-mr.sh
 ```
+
+---
+
+## Lab 2 — Key/Value Server with Fault Tolerance
+
+A fault-tolerant key/value server with **optimistic concurrency control** via versioned puts, and a **distributed lock** built on top of it. Designed to handle dropped RPC requests and replies on unreliable networks.
+
+### Architecture
+
+```
+┌─────────────────────────────────────────┐
+│              Application                │
+│   clerk.Put(key, val, ver)              │
+│   clerk.Get(key)                        │
+│   lock.Acquire() / lock.Release()       │
+└──────────────┬──────────────────────────┘
+               │ RPC (unreliable network)
+               ▼
+┌─────────────────────────────────────────┐
+│             KVServer                    │
+│   map[string]→(value, version)          │
+│   versioned Put = compare-and-swap      │
+└─────────────────────────────────────────┘
+```
+
+### What's implemented
+
+**KV Server** (`src/kvsrv1/server.go`)
+- In-memory map storing `(value, version)` per key
+- `Get` returns current value and version; `ErrNoKey` if absent
+- `Put` is a **compare-and-swap**: only applies if the client's version matches the server's current version, then increments it — returns `ErrVersion` on mismatch
+- All operations protected by `sync.Mutex` for concurrent client safety
+
+**Clerk** (`src/kvsrv1/client.go`)
+- `Get`: retries forever until a reply is received (safe — reads are idempotent)
+- `Put`: retries on dropped messages, distinguishing between first attempt and retries:
+  - `ErrVersion` on first attempt → returns `ErrVersion` (Put definitely did not execute)
+  - `ErrVersion` on a retry → returns `ErrMaybe` (Put may have executed; reply was dropped)
+
+**Distributed Lock** (`src/kvsrv1/lock/lock.go`)
+- Built entirely on `Clerk.Put` and `Clerk.Get` — no server-side lock logic
+- Uses the lock key's value as state: `""` = free, `clientID` = held
+- `Acquire`: spins doing `Get` → `Put(myID)`, handles `ErrMaybe` by re-checking the value
+- `Release`: loops until `Get` confirms the key is `""`, handles dropped Put replies
+
+### Key design insight
+
+The versioned `Put` is a **distributed compare-and-swap**. Two clients racing to acquire the lock both see `val=""` and both attempt `Put(myID, ver)` — but only one has the correct version after the first winner's write. The loser gets `ErrVersion` and retries. No server-side lock logic is needed; mutual exclusion falls out of the CAS primitive.
+
+### Test results
+
+```
+# KV Server tests
+$ cd src/kvsrv1 && go test -race -v
+--- PASS: TestReliablePut
+--- PASS: TestPutConcurrentReliable
+--- PASS: TestMemPutManyClientsReliable
+--- PASS: TestUnreliableNet
+PASS
+
+# Distributed lock tests
+$ cd src/kvsrv1/lock && go test -race -v
+--- PASS: TestOneClientReliable
+--- PASS: TestManyClientsReliable
+--- PASS: TestOneClientUnreliable
+--- PASS: TestManyClientsUnreliable
+PASS
+```
+
+### Running
+
+```bash
+# KV server tests
+cd src/kvsrv1 && go test -race -v
+
+# Lock tests
+cd src/kvsrv1/lock && go test -race -v
+```
