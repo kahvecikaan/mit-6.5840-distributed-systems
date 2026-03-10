@@ -19,6 +19,12 @@ import (
 	"6.5840/tester1"
 )
 
+const (
+	roleFollower  = "follower"
+	roleCandidate = "candidate"
+	roleLeader    = "leader"
+)
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -33,7 +39,7 @@ type Raft struct {
 	currentTerm int // latest term this server has seen
 	votedFor    int // candidateId that received vote in current term (-1 if none)
 
-	role            string    // 'follower', 'candidate', 'leader'
+	role            string    // roleFollower, roleCandidate, or roleLeader
 	lastHeartbeat   time.Time // when we last heard from a leader
 	electionTimeout time.Duration
 }
@@ -48,7 +54,7 @@ func (rf *Raft) GetState() (int, bool) {
 	var isLeader bool
 	// Your code here (3A).
 	term = rf.currentTerm
-	isLeader = rf.role == "leader"
+	isLeader = rf.role == roleLeader
 	return term, isLeader
 }
 
@@ -146,23 +152,20 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	reply.VoteGranted = false
 
-	candidateTerm := args.Term
-	candidateId := args.CandidateId
-
 	// stale candidate
-	if candidateTerm < rf.currentTerm {
+	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		return
 	}
 
 	// this voter is behind
-	if candidateTerm > rf.currentTerm {
-		rf.stepDown(candidateTerm)
+	if args.Term > rf.currentTerm {
+		rf.stepDown(args.Term)
 	}
 
 	// if I haven't voted, or already voted for them
-	if rf.votedFor == -1 || rf.votedFor == candidateId {
-		rf.votedFor = candidateId
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		rf.votedFor = args.CandidateId
 		rf.lastHeartbeat = time.Now() // don't start its own election for now
 
 		reply.VoteGranted = true
@@ -192,9 +195,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// we have a valid leader
-	rf.currentTerm = lTerm
+	rf.stepDown(lTerm)
 	rf.lastHeartbeat = time.Now()
-	rf.role = "follower"
 	reply.Term = rf.currentTerm
 	reply.Success = true
 }
@@ -251,7 +253,7 @@ func (rf *Raft) ticker() {
 		// Check if a leader election should be started.
 		rf.mu.Lock()
 		// only the server whose election timer expires first becomes a candidate and start an election
-		shouldElect := rf.role != "leader" && time.Since(rf.lastHeartbeat) > rf.electionTimeout
+		shouldElect := rf.role != roleLeader && time.Since(rf.lastHeartbeat) > rf.electionTimeout
 		rf.mu.Unlock()
 		if shouldElect {
 			rf.startElection()
@@ -266,7 +268,7 @@ func (rf *Raft) ticker() {
 
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
-	rf.role = "candidate"
+	rf.role = roleCandidate
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	rf.lastHeartbeat = time.Now()
@@ -303,7 +305,7 @@ func (rf *Raft) startElection() {
 			}
 
 			// stale election
-			if electionTerm != rf.currentTerm || rf.role != "candidate" {
+			if electionTerm != rf.currentTerm || rf.role != roleCandidate {
 				return
 			}
 
@@ -311,8 +313,8 @@ func (rf *Raft) startElection() {
 				votes++
 
 				// got the majority of the votes
-				if votes > len(rf.peers)/2 && rf.role == "candidate" {
-					rf.role = "leader"
+				if votes > len(rf.peers)/2 {
+					rf.role = roleLeader
 					go rf.sendHeartbeats()
 				}
 			}
@@ -326,7 +328,7 @@ func (rf *Raft) startElection() {
 func (rf *Raft) sendHeartbeats() {
 	for !rf.killed() {
 		rf.mu.Lock()
-		if rf.role != "leader" {
+		if rf.role != roleLeader {
 			rf.mu.Unlock()
 			return
 		}
@@ -358,7 +360,7 @@ func (rf *Raft) sendHeartbeats() {
 
 func (rf *Raft) stepDown(newTerm int) {
 	rf.currentTerm = newTerm
-	rf.role = "follower"
+	rf.role = roleFollower
 	rf.votedFor = -1
 }
 
@@ -381,7 +383,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (3A, 3B, 3C).
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.role = "follower"
+	rf.role = roleFollower
 	rf.lastHeartbeat = time.Now()
 	rf.electionTimeout = randomDurationBetween(300*time.Millisecond, 500*time.Millisecond)
 
