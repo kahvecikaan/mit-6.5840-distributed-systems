@@ -56,13 +56,7 @@ type Raft struct {
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
-	var term int
-	var isLeader bool
-	// Your code here (3A).
-	term = rf.currentTerm
-	isLeader = rf.role == roleLeader
-	return term, isLeader
+	return rf.currentTerm, rf.role == roleLeader
 }
 
 // save Raft's persistent state to stable storage,
@@ -150,6 +144,10 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int // follower's current term
 	Success bool
+
+	// Fast backup hints (only meaningful when Success=false)
+	ConflictTerm  int // term of the conflicting entry on the follower
+	ConflictIndex int // first index the follower has with that term
 }
 
 type LogEntry struct {
@@ -186,8 +184,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// if I haven't voted, or already voted for them
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-		myLastIdx := len(rf.log) - 1
-		myLastTerm := rf.log[myLastIdx].Term
+		myLastIdx, myLastTerm := rf.lastLogInfo()
 
 		// candidate's up-to-date
 		if args.LastLogTerm > myLastTerm || (args.LastLogTerm == myLastTerm && args.LastLogIndex >= myLastIdx) {
@@ -234,12 +231,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// log is too short — we don't have an entry at PrevLogIndex
 	if args.PrevLogIndex >= len(rf.log) {
 		reply.Success = false
+		reply.ConflictTerm = -1           // not a term conflict, just too short
+		reply.ConflictIndex = len(rf.log) // "my log is this long, try here"
 		return
 	}
 
 	// log has an entry at PrevLogIndex but with a different term — logs diverged
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+
+		// walk backward to find the first index with this term
+		reply.ConflictIndex = args.PrevLogIndex
+		for reply.ConflictIndex > 0 && rf.log[reply.ConflictIndex-1].Term == reply.ConflictTerm {
+			reply.ConflictIndex--
+		}
 		return
 	}
 
@@ -344,11 +350,12 @@ func (rf *Raft) startElection() {
 	electionTerm := rf.currentTerm
 	votes := 1 // vote for self
 
+	lastLogIdx, lastLogTerm := rf.lastLogInfo()
 	args := RequestVoteArgs{
 		Term:         electionTerm,
 		CandidateId:  rf.me,
-		LastLogIndex: len(rf.log) - 1,
-		LastLogTerm:  rf.log[len(rf.log)-1].Term,
+		LastLogIndex: lastLogIdx,
+		LastLogTerm:  lastLogTerm,
 	}
 
 	rf.mu.Unlock()
@@ -381,14 +388,15 @@ func (rf *Raft) startElection() {
 			if reply.VoteGranted {
 				votes++
 
-				// got the majority of the votes
-				if votes > len(rf.peers)/2 {
+				// got the majority of the votes — exact equality prevents duplicate launches
+				if votes == len(rf.peers)/2+1 {
 					rf.role = roleLeader
-					go rf.sendHeartbeats()
-					for i := 0; i < len(rf.peers); i++ {
+					// initialize leader state BEFORE launching heartbeats to avoid race
+					for i := range rf.peers {
 						rf.nextIndex[i] = len(rf.log) // optimistic - assume everyone is up-to-date
 						rf.matchIndex[i] = 0          // pessimistic - haven't confirmed anything yet
 					}
+					go rf.sendHeartbeats()
 				}
 			}
 		}(i)
@@ -396,7 +404,7 @@ func (rf *Raft) startElection() {
 }
 
 // sendHeartbeats is launched as a goroutine when this server becomes leader.
-// Sends empty AppendEntries to all peers every 100ms to prevent election timeouts.
+// Sends AppendEntries RPCs (heartbeats and/or log entries) to all peers every 100ms.
 // Exits automatically when this server is no longer the leader or is killed.
 func (rf *Raft) sendHeartbeats() {
 	for !rf.killed() {
@@ -406,27 +414,19 @@ func (rf *Raft) sendHeartbeats() {
 			return
 		}
 
-		peerArgs := make([]AppendEntriesArgs, len(rf.peers))
 		for i := range rf.peers {
 			if i == rf.me {
 				continue
 			}
-
-			peerArgs[i] = rf.buildAppendEntriesArgs(i)
+			args := rf.buildAppendEntriesArgs(i)
+			go func(server int, args AppendEntriesArgs) {
+				reply := AppendEntriesReply{}
+				if rf.sendAppendEntries(server, &args, &reply) {
+					rf.handleAppendEntriesReply(server, &args, &reply)
+				}
+			}(i, args)
 		}
 		rf.mu.Unlock()
-
-		for i := range rf.peers {
-			if i == rf.me {
-				continue
-			}
-			go func(server int) {
-				reply := AppendEntriesReply{}
-				if rf.sendAppendEntries(server, &peerArgs[server], &reply) {
-					rf.handleAppendEntriesReply(server, &peerArgs[server], &reply)
-				}
-			}(i)
-		}
 
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -449,8 +449,8 @@ func (rf *Raft) buildAppendEntriesArgs(peer int) AppendEntriesArgs {
 	}
 }
 
-// handleAppendEntriesReply process the reply from a single peer's AppendEntries RPC
-// It acquires rf.mu itself - the caller must NOT hold the lock
+// handleAppendEntriesReply processes the reply from a single peer's AppendEntries RPC.
+// It acquires rf.mu itself — the caller must NOT hold the lock.
 func (rf *Raft) handleAppendEntriesReply(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -459,29 +459,48 @@ func (rf *Raft) handleAppendEntriesReply(server int, args *AppendEntriesArgs, re
 		rf.stepDown(reply.Term)
 	}
 
-	// stale reply - we're no longer leader or term changed since we sent this RPC
+	// stale reply — we're no longer leader or term changed since we sent this RPC
 	if rf.role != roleLeader || rf.currentTerm != args.Term {
 		return
 	}
 
 	if reply.Success {
-		// follower accepted - update tracking
+		// follower accepted — update tracking
 		newMatchIdx := args.PrevLogIndex + len(args.Entries)
 		rf.matchIndex[server] = newMatchIdx
 		rf.nextIndex[server] = newMatchIdx + 1
 
-		// check if we can advance commitIdx
 		rf.advanceCommitIndex()
 	} else {
-		// log inconsistency - back up and retry next cycle
-		rf.nextIndex[server]--
+		// log inconsistency — use follower's hint to skip entire conflicting terms
+		rf.nextIndex[server] = rf.computeNextIndexAfterConflict(reply)
 	}
+}
+
+// computeNextIndexAfterConflict uses the follower's conflict hint to determine
+// the next index to try. Caller must hold rf.mu.
+func (rf *Raft) computeNextIndexAfterConflict(reply *AppendEntriesReply) int {
+	// follower's log was too short — jump to its length
+	if reply.ConflictTerm == -1 {
+		return reply.ConflictIndex
+	}
+
+	// search our log for the follower's conflict term
+	for i := len(rf.log) - 1; i > 0; i-- {
+		if rf.log[i].Term == reply.ConflictTerm {
+			// we have this term — try one past our last entry with it
+			return i + 1
+		}
+	}
+
+	// we don't have this term — skip to where it starts on follower
+	return reply.ConflictIndex
 }
 
 // advanceCommitIndex checks if there's a higher index that majority has replicated
 // The caller must hold the lock for the Raft instance
 func (rf *Raft) advanceCommitIndex() {
-	for n := len(rf.log) - 1; n > 0; n-- {
+	for n := len(rf.log) - 1; n > rf.commitIndex; n-- {
 		if rf.log[n].Term != rf.currentTerm {
 			continue
 		}
@@ -501,10 +520,18 @@ func (rf *Raft) advanceCommitIndex() {
 	}
 }
 
+// lastLogInfo returns the index and term of the last log entry. Caller must hold rf.mu.
+func (rf *Raft) lastLogInfo() (index int, term int) {
+	index = len(rf.log) - 1
+	return index, rf.log[index].Term
+}
+
 func (rf *Raft) stepDown(newTerm int) {
-	rf.currentTerm = newTerm
+	if newTerm > rf.currentTerm {
+		rf.currentTerm = newTerm
+		rf.votedFor = -1
+	}
 	rf.role = roleFollower
-	rf.votedFor = -1
 }
 
 func (rf *Raft) applier() {
