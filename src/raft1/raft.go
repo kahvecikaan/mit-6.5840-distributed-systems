@@ -123,8 +123,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
-	Term        int // candidate's term
-	CandidateId int // candidate requesting vote
+	Term         int // candidate's term
+	CandidateId  int // candidate requesting vote
+	LastLogIndex int // idx of the candidate's last log entry
+	LastLogTerm  int // term of candidate's last log entry
 }
 
 // example RequestVote RPC reply structure.
@@ -159,9 +161,11 @@ type LogEntry struct {
 // It is never called directly — the labrpc framework invokes it automatically when
 // another server (a candidate) sends a vote request via sendRequestVote.
 //
-// Grants the vote if the candidate's term is current, and we haven't voted
-// for a different candidate this term. Resets the election timer on a granted vote
-// so the voter doesn't start a competing election while helping a candidate win.
+// Grants the vote if: (1) the candidate's term is at least as current as ours,
+// (2) we haven't already voted for a different candidate this term, and
+// (3) the candidate's log is at least as up-to-date as ours (election restriction,
+// Section 5.4.1 — higher last term wins; same last term → longer or equal log wins).
+// Resets the election timer on a granted vote to prevent competing elections.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
@@ -182,10 +186,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// if I haven't voted, or already voted for them
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-		rf.votedFor = args.CandidateId
-		rf.lastHeartbeat = time.Now() // don't start its own election for now
+		myLastIdx := len(rf.log) - 1
+		myLastTerm := rf.log[myLastIdx].Term
 
-		reply.VoteGranted = true
+		// candidate's up-to-date
+		if args.LastLogTerm > myLastTerm || (args.LastLogTerm == myLastTerm && args.LastLogIndex >= myLastIdx) {
+			rf.votedFor = args.CandidateId
+			rf.lastHeartbeat = time.Now() // don't start its own election for now
+
+			reply.VoteGranted = true
+		}
 	}
 
 	reply.Term = rf.currentTerm
@@ -335,8 +345,10 @@ func (rf *Raft) startElection() {
 	votes := 1 // vote for self
 
 	args := RequestVoteArgs{
-		Term:        electionTerm,
-		CandidateId: rf.me,
+		Term:         electionTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: len(rf.log) - 1,
+		LastLogTerm:  rf.log[len(rf.log)-1].Term,
 	}
 
 	rf.mu.Unlock()
@@ -495,6 +507,30 @@ func (rf *Raft) stepDown(newTerm int) {
 	rf.votedFor = -1
 }
 
+func (rf *Raft) applier() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		if rf.commitIndex > rf.lastApplied {
+			startIdx := rf.lastApplied + 1
+			toSend := make([]LogEntry, rf.commitIndex-rf.lastApplied)
+			copy(toSend, rf.log[rf.lastApplied+1:rf.commitIndex+1])
+			rf.lastApplied = rf.commitIndex
+			rf.mu.Unlock()
+
+			for idx, entry := range toSend {
+				rf.applyCh <- raftapi.ApplyMsg{
+					CommandValid: true,
+					Command:      entry.Command,
+					CommandIndex: startIdx + idx,
+				}
+			}
+		} else {
+			rf.mu.Unlock()
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+}
+
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -532,6 +568,9 @@ func Make(
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+
+	// start applier goroutine for sending committed entries to the service layer
+	go rf.applier()
 
 	return rf
 }
