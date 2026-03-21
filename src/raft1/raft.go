@@ -159,7 +159,7 @@ type LogEntry struct {
 // It is never called directly — the labrpc framework invokes it automatically when
 // another server (a candidate) sends a vote request via sendRequestVote.
 //
-// Grants the vote if the candidate's term is current and we haven't voted
+// Grants the vote if the candidate's term is current, and we haven't voted
 // for a different candidate this term. Resets the election timer on a granted vote
 // so the voter doesn't start a competing election while helping a candidate win.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
@@ -199,23 +199,62 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return rf.peers[server].Call("Raft.RequestVote", args, reply)
 }
 
+// AppendEntries is the RPC HANDLER that runs on a FOLLOWER receiving log entries (or a heartbeat)
+// from the leader. It verifies the leader's term, checks that the follower's log matches the
+// leader's at PrevLogIndex/PrevLogTerm (Log Matching Property), resolves any conflicts by
+// truncating divergent entries, appends new entries, and advances the follower's commitIndex
+// based on the leader's LeaderCommit.
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	lTerm := args.Term
 	// leader is outdated
-	if lTerm < rf.currentTerm {
+	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
 
 	// we have a valid leader
-	rf.stepDown(lTerm)
+	rf.stepDown(args.Term)
 	rf.lastHeartbeat = time.Now()
 	reply.Term = rf.currentTerm
 	reply.Success = true
+
+	// log is too short — we don't have an entry at PrevLogIndex
+	if args.PrevLogIndex >= len(rf.log) {
+		reply.Success = false
+		return
+	}
+
+	// log has an entry at PrevLogIndex but with a different term — logs diverged
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		return
+	}
+
+	// walk through leader's entries: skip matching, truncate + append on conflict or gap
+	for i := range args.Entries {
+		logIdx := args.PrevLogIndex + 1 + i
+
+		// beyond our log — append everything from here onward
+		if logIdx >= len(rf.log) {
+			rf.log = append(rf.log, args.Entries[i:]...)
+			break
+		}
+
+		// conflicting entry — truncate here and append the rest
+		if rf.log[logIdx].Term != args.Entries[i].Term {
+			rf.log = rf.log[:logIdx]
+			rf.log = append(rf.log, args.Entries[i:]...)
+			break
+		}
+	}
+
+	// advance commit index based on leader's commit progress
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+	}
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
