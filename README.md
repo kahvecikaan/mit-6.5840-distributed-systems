@@ -145,3 +145,109 @@ cd src/kvsrv1 && go test -race -v
 # Lock tests
 cd src/kvsrv1/lock && go test -race -v
 ```
+
+---
+
+## Lab 3 — Raft Consensus
+
+A full implementation of the [Raft consensus algorithm](https://raft.github.io/raft.pdf) covering leader election, log replication, persistence, and log compaction via snapshots.
+
+### Architecture
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                    Service Layer (KV server)              │
+│          applyCh ◄──── committed entries / snapshots      │
+│          Snapshot() ──► trim Raft log                     │
+└──────────────────────┬───────────────────────────────────┘
+                       │
+┌──────────────────────▼───────────────────────────────────┐
+│                       Raft Layer                         │
+│                                                          │
+│  ┌──────────┐    AppendEntries RPC    ┌──────────┐       │
+│  │  Leader   │ ─────────────────────► │ Follower │       │
+│  │          │ ◄───────────────────── │          │       │
+│  │          │  InstallSnapshot RPC   │          │       │
+│  │          │ ─────────────────────► │          │       │
+│  └──────────┘                        └──────────┘       │
+│       ▲                                                  │
+│       │ RequestVote RPC                                  │
+│  ┌──────────┐                                            │
+│  │Candidate │                                            │
+│  └──────────┘                                            │
+└──────────────────────────────────────────────────────────┘
+```
+
+### What's implemented
+
+**Lab 3A — Leader Election** (`src/raft1/raft.go`)
+- Randomized election timeouts (300–500ms) to avoid split votes
+- Term-based voting with the election restriction (Section 5.4.1) — candidates must have an up-to-date log to win
+- Periodic heartbeats (100ms) from the leader to suppress elections
+- `stepDown()` helper for consistent term/role transitions
+
+**Lab 3B — Log Replication**
+- `AppendEntries` RPC handler with the Log Matching Property: verifies `PrevLogIndex`/`PrevLogTerm` before accepting entries
+- Fast backup optimization with `ConflictTerm`/`ConflictIndex` hints — skips entire conflicting terms instead of decrementing `nextIndex` one at a time
+- `advanceCommitIndex()` only commits entries from the current term (Figure 8 safety)
+- Dedicated `applier()` goroutine delivers committed entries to the service layer via `applyCh`
+
+**Lab 3C — Persistence**
+- `persist()` / `readPersist()` using `labgob` encoding for `currentTerm`, `votedFor`, `log`, and snapshot metadata
+- `encodeRaftState()` helper to avoid duplication between `persist()` and `Snapshot()`
+- Persistence calls at every state-mutation point: vote grants, term changes, log appends, log truncations
+
+**Lab 3D — Log Compaction (Snapshots)**
+- `Snapshot()`: trims the log and persists both Raft state and snapshot bytes atomically
+- Offset-aware indexing via `toSlicePos()` and `lastLogIndex()` — translates between Raft indices and slice positions
+- Anchor entry at `log[0]` preserves the term of the last snapshotted entry
+- `InstallSnapshot` RPC for catching up stale followers — manual lock management to avoid deadlock with `applyCh`
+- `replicateTo()` dispatches either `AppendEntries` or `InstallSnapshot` per peer based on `nextIndex`
+
+### Test results
+
+```
+$ cd src/raft1 && go test -race
+Test (3A): initial election...                             Passed
+Test (3A): election after network failure...               Passed
+Test (3A): multiple elections...                           Passed
+Test (3B): basic agreement...                              Passed
+Test (3B): RPC byte count...                               Passed
+Test (3B): test progressive failure of followers...        Passed
+Test (3B): test failure of leaders...                      Passed
+Test (3B): agreement after follower reconnects...          Passed
+Test (3B): no agreement if too many followers disconnect...Passed
+Test (3B): concurrent Start()s...                          Passed
+Test (3B): rejoin of partitioned leader...                 Passed
+Test (3B): leader backs up quickly over incorrect follower logs...Passed
+Test (3B): RPC counts aren't too high...                   Passed
+Test (3C): basic persistence...                            Passed
+Test (3C): more persistence...                             Passed
+Test (3C): partitioned leader and target removed then re-added...Passed
+Test (3C): figure 8...                                     Passed
+Test (3C): unreliable agreement...                         Passed
+Test (3C): figure 8 (unreliable)...                        Passed
+Test (3C): churn...                                        Passed
+Test (3C): unreliable churn...                             Passed
+Test (3D): snapshots basic...                              Passed
+Test (3D): install snapshots (disconnect)...               Passed
+Test (3D): install snapshots (disconnect) (unreliable)...  Passed
+Test (3D): install snapshots (crash)...                    Passed
+Test (3D): install snapshots (crash) (unreliable)...       Passed
+Test (3D): crash and restart all servers...                 Passed
+Test (3D): snapshot initialization after crash...          Passed
+PASS
+```
+
+### Running
+
+```bash
+cd src/raft1
+
+# Run all tests
+go test -race
+
+# Run a specific lab section
+go test -run 3A -race
+go test -run 3D -race -v
+```
